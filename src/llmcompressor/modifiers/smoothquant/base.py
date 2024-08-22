@@ -18,7 +18,8 @@ DEFAULT_SMOOTHQUANT_MAPPINGS = [
     [["re:.*gate_proj", "re:.*up_proj"], "re:.*post_attention_layernorm"],
 ]
 
-__all__ = ["SmoothQuantScale", "SmoothQuantMapping", "SmoothQuantModifier"]
+
+__all__ = ["SmoothQuantScale", "SmoothQuantMapping", "SmoothQuantModifier", "DEFAULT_SMOOTHQUANT_MAPPINGS", "DEFAULT_SMOOTHQUANT_MAPPINGS_MISTRAL"]
 
 
 @dataclass
@@ -123,6 +124,8 @@ class SmoothQuantModifier(Modifier):
                 f"Expected start to be None or -1, got {self.end}"
             )
 
+        if self.mappings is None:
+            self.mappings = resolve_mapping(state.model)
         self.ignore = [] if not self.ignore else self.ignore
         self.resolved_mappings_ = self._resolve_mappings(state.model)
         self.scales_ = {}
@@ -334,3 +337,16 @@ class SmoothQuantModifier(Modifier):
         )
         scales = torch.where(weight_scales > 0.0, scales, activation_scales)
         return scales
+
+
+def resolve_mapping(model):
+    """
+    Resolve the default mappings based on the model type
+    """
+    if "MixtralForC" in model.config.architectures:
+        return DEFAULT_SMOOTHQUANT_MAPPINGS_MISTRAL
+    return DEFAULT_SMOOTHQUANT_MAPPINGS
+
+    # if not in registry:
+    #     raise logger.warning(f"Default mappings could not be inferred, kindly specify mappings")
+    
