@@ -1,6 +1,8 @@
 from itertools import cycle
 from typing import Callable, Dict, List, Optional, Tuple
 
+import gc
+import pynvml
 import torch
 from torch.nn import Module
 from torch.utils.data import DataLoader
@@ -97,6 +99,35 @@ def run_calibration_forward(
 
         # TODO: not ideal, figure out where we aren't freeing memory instead
         # currently without this we run OOM on the 2nd forward pass
+        print_gpu_memory()
+        print_memory_free_MiB()
+
+        import os
+        import psutil
+        pid = os.getpid()
+        python_process = psutil.Process(pid)
+        memoryUse = python_process.memory_info()[0]/2.**30  # memory use in GB...I think
+        print('memory use:', memoryUse)
+
+        #gc.collect()
         torch.cuda.empty_cache()
 
     return intermediates
+
+
+def print_gpu_memory():
+    total_memory = torch.cuda.get_device_properties(0).total_memory
+    allocated_memory = torch.cuda.memory_allocated()
+    cached_memory = torch.cuda.memory_reserved()
+
+    print(f"Allocated: {allocated_memory / (1024 ** 2):.2f} MB")
+    print(f"Cached: {cached_memory / (1024 ** 2):.2f} MB")
+    print(f"Total available: {total_memory / (1024 ** 2):.2f} MB")
+    print(torch.cuda.mem_get_info())
+    print()
+
+def print_memory_free_MiB(gpu_index=0):
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(int(gpu_index))
+    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    print(mem_info.free // 1024 ** 2)
