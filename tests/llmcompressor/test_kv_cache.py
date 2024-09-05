@@ -13,8 +13,9 @@ from llmcompressor.transformers import SparseAutoModelForCausalLM, oneshot
 MODEL_IDS = [
     "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     "microsoft/Phi-3-mini-4k-instruct",
-    "Qwen/Qwen2-VL-7B-Instruct",
-    "mistralai/Mistral-7B-v0.1" "deepseek-ai/DeepSeek-Coder-V2-Instruct",
+    "Qwen/Qwen2-7B-Instruct",
+    "mistralai/Mistral-7B-v0.1",
+    "deepseek-ai/DeepSeek-Coder-V2-Instruct",
 ]
 
 
@@ -148,6 +149,13 @@ def test_kv_cache_with_gptq(tmp_path):
     recipe = f"""
     quant_stage:
         quant_modifiers:
+            QuantizationModifier:
+                kv_cache_scheme:
+                    num_bits: {kv_cache_num_bits}
+                    type: {kv_cache_type}
+                    strategy: {kv_cache_strategy}
+                    dynamic: {kv_cache_dynamic}
+                    symmetric: {kv_cache_symmetric}
             GPTQModifier:
                 sequential_update: false
                 ignore: ["lm_head"]
@@ -160,13 +168,7 @@ def test_kv_cache_with_gptq(tmp_path):
                             strategy: "channel"
                             actorder: False
                         targets: ["Linear"]
-        QuantizationModifier:
-            kv_cache_scheme:
-                num_bits: {kv_cache_num_bits}
-                type: {kv_cache_type}
-                strategy: {kv_cache_strategy}
-                dynamic: {kv_cache_dynamic}
-                symmetric: {kv_cache_symmetric}
+
     """
     output_dir = str(tmp_path)
 
