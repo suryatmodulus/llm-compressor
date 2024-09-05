@@ -13,7 +13,6 @@ from llmcompressor.transformers import SparseAutoModelForCausalLM, oneshot
 MODEL_IDS = [
     "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     "microsoft/Phi-3-mini-4k-instruct",
-    "Qwen/Qwen2-7B-Instruct",
     "mistralai/Mistral-7B-v0.1",
     "deepseek-ai/DeepSeek-Coder-V2-Instruct",
 ]
