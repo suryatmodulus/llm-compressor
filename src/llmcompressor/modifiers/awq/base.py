@@ -1,20 +1,29 @@
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from loguru import logger
 from torch.nn import Module
+from tqdm import tqdm
 
 from llmcompressor.core import Event, State
 from llmcompressor.modifiers import Modifier
 from llmcompressor.modifiers.utils.pytorch_helpers import run_calibration_forward
-from llmcompressor.pytorch.utils import pseudo_quantize_tensor, tensors_module_forward
+from llmcompressor.pytorch.utils import (
+    pseudo_quantize_tensor,
+    tensor_forward_with_input_args,
+)
 from llmcompressor.utils.fsdp.helpers import get_fsdp_parent
-from llmcompressor.utils.pytorch.module import get_layers, get_matching_layer
+from llmcompressor.utils.pytorch.module import (
+    get_layers,
+    get_matching_layer,
+    get_parent_by_name,
+)
 
 DEFAULT_AWQ_MAPPINGS = [
     [["re:.*q_proj", "re:.*k_proj", "re:.*v_proj"], "re:.*input_layernorm"],
     [["re:.*gate_proj", "re:.*up_proj"], "re:.*post_attention_layernorm"],
+    [["re:.*down_proj"], "re:.*up_proj"],
 ]
 
 __all__ = ["AWQScale", "AWQMapping", "AWQModifier"]
@@ -44,6 +53,8 @@ class AWQMapping:
     smooth_name: str
     smooth_layer: Module
     balance_layers: List[Module]
+    parent: Optional[Module] = None
+    parent_name: Optional[str] = None
 
 
 class AWQModifier(Modifier):
@@ -90,13 +101,15 @@ class AWQModifier(Modifier):
     num_calibration_steps: Optional[int] = None
     calibration_function: Optional[Callable] = None
     group_size: int = 128
-    max_chunk_memory: int = (1024 * 1024 * 1024,)
+    max_chunk_memory: int = 1024 * 1024 * 1024
     bits: int = 4
     symmetric: bool = True
+    duo_scaling: bool = True
 
     hooks_: Optional[List] = None
     resolved_mappings_: Optional[List] = None
     scales_: Optional[Dict] = None
+    module_kwargs_: Optional[Dict] = None
 
     def on_initialize_structure(self, state: State, **kwargs):
         pass  # nothing needed for this modifier
@@ -126,6 +139,7 @@ class AWQModifier(Modifier):
         calibration_dataloader = state.data.calib
         self.hooks_ = []
 
+        self._get_module_kwargs(state.model, calibration_dataloader)
         self._setup_scale_hooks()
         self._calibrate(state.model, calibration_dataloader)
         self._concat_collected_activations()
@@ -178,14 +192,30 @@ class AWQModifier(Modifier):
                     balance_layers = []
                     for balance_suffix in to_balance:
                         # find the submodule that matches the activation layer
-                        _, balance_layer = get_matching_layer(
+                        balance_name, balance_layer = get_matching_layer(
                             balance_suffix, layer_name, model
                         )
                         if balance_layer:
                             balance_layers.append(balance_layer)
                     # each mapping can contain multiple layers to balance, but only
                     # one layer to smooth
-                    mapping = AWQMapping(layer_name, smooth_layer, balance_layers)
+
+                    if len(balance_layers) == 1:
+                        # for single balance layer, parent is the balance layer
+                        parent_name, parent = balance_name, balance_layer
+                    else:
+                        # for multiple balance layers,
+                        # parent of any balance layer is the parent
+                        parent_name, parent = get_parent_by_name(
+                            layer_name=balance_name, model=model
+                        )
+                    mapping = AWQMapping(
+                        layer_name,
+                        smooth_layer,
+                        balance_layers,
+                        parent=parent,
+                        parent_name=parent_name,
+                    )
                     resolved_mappings.append(mapping)
         return resolved_mappings
 
@@ -209,7 +239,10 @@ class AWQModifier(Modifier):
 
         for mapping in self.resolved_mappings_:
             name = mapping.smooth_name
-            layer = mapping.smooth_layer
+            # storing inps to first balance layer
+            # is enough, as other balance layers
+            # get the same input
+            layer = mapping.balance_layers[0]
             self.hooks_.append(layer.register_forward_hook(create_hook_fn(name)))
 
     @torch.no_grad()
@@ -265,16 +298,17 @@ class AWQModifier(Modifier):
         :param model: model to apply smoothing to
         """
         logger.info("Smoothing activation scales...")
-        for mapping in self.resolved_mappings_:
+        for mapping in tqdm(self.resolved_mappings_):
             smooth_layer = mapping.smooth_layer
             balance_layers = mapping.balance_layers
 
             activations = self.scales_[mapping.smooth_name].inps
-            module2inspect = smooth_layer
+
+            module2inspect = mapping.parent
 
             # [STEP 1]: Compute per-channel mean of normalised weights
             # All layer weights are concatted together
-            weight = torch.cat([_m.weight for _m in smooth_layer], dim=0)
+            weight = torch.cat([_m.weight for _m in balance_layers], dim=0)
             org_shape = weight.shape
             # The weights are reshaped to be organised by quantization group
             weight = weight.view(-1, self.group_size)
@@ -313,7 +347,9 @@ class AWQModifier(Modifier):
 
             # [STEP 3]: Compute output of module
             with torch.no_grad():
-                fp16_output = tensors_module_forward(inp, module2inspect)
+                fp16_output = self._forward_input_with_kwargs(
+                    module=module2inspect, inputs=inp, input_kwargs=self.module_kwargs_
+                )
 
             # [STEP 4]: Compute loss
             best_scales = self._compute_best_scale(
@@ -325,14 +361,14 @@ class AWQModifier(Modifier):
             @torch.no_grad()
             def smooth(module):
                 if module in balance_layers:
-                    module.weight.mul_(scales.view(1, -1))
+                    module.weight.mul_(scales.view(1, -1).to(module.weight.device))
                 elif module == smooth_layer:
                     if module.weight.ndim == 1:
-                        module.weight.div_(scales)
+                        module.weight.div_(scales.to(module.weight.device))
                     else:
-                        module.weight.div_(scales.view(-1, 1))
+                        module.weight.div_(scales.view(-1, 1).to(module.weight.device))
                     if hasattr(module, "bias") and module.bias is not None:
-                        module.bias.div_(scales)
+                        module.bias.div_(scales.to(module.bias.device))
 
             parent = get_fsdp_parent(mapping.smooth_name, model)
             if parent is not None:
@@ -401,14 +437,16 @@ class AWQModifier(Modifier):
                     pseudo_quantize_tensor(
                         w=fc.weight.data,
                         symmetric=self.symmetric,
-                        bits=self.bits,
+                        bit_width=self.bits,
                         group_size=self.group_size,
                     )[0]
                     / scales_view
                 )
 
             # W * X
-            int_w_output = tensors_module_forward(x, module2inspect)
+            int_w_output = self._forward_input_with_kwargs(
+                module=module2inspect, inputs=x, input_kwargs=self.module_kwargs_
+            )
 
             # compute mean squared error (L2 norm)
             loss = self._compute_loss(fp16_output, int_w_output, device)
@@ -465,3 +503,87 @@ class AWQModifier(Modifier):
         loss /= num_elements
 
         return loss
+
+    def _get_module_kwargs(self, model, dataloader):
+        _, modules = next(iter(get_layers("re:.*layers", model).items()))
+
+        samples = [batch["input_ids"] for batch in dataloader]
+
+        samples = torch.cat(samples, dim=0)
+
+        inps = []
+        layer_kwargs = {}
+
+        best_device = "cuda"
+        modules[0] = modules[0].to(best_device)
+        # self.awq_model.move_embed(self.model, best_device)
+
+        # get input and kwargs to layer 0
+        # with_kwargs is only supported in PyTorch 2.0
+        # use this Catcher hack for now
+        class Catcher(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, *args, **kwargs):
+                # assume first input to forward is hidden states
+                if len(args) > 0:
+                    hidden_states = args[0]
+                    del args
+                else:
+                    first_key = list(kwargs.keys())[0]
+                    hidden_states = kwargs.pop(first_key)
+
+                inps.append(hidden_states)
+                layer_kwargs.update(kwargs)
+                raise ValueError  # early exit to break later inference
+
+        # patch layer 0 to catch input and kwargs
+        modules[0] = Catcher(modules[0])
+        try:
+            model(samples.to(next(model.parameters()).device))
+        except ValueError:  # work with early exit
+            pass
+        modules[0] = modules[0].module  # restore
+
+        # Update the layer kwargs with `prepare_inputs_for_generation` method
+        # that takes care of everything to avoid unexpected errors.
+        layer_kwargs = model.prepare_inputs_for_generation(samples, **layer_kwargs)
+        # Pop the input_ids as they are not needed at all.
+        layer_kwargs.pop("input_ids")
+
+        del samples
+        inps = inps[0]
+
+        # modules[0] = modules[0]
+
+        torch.cuda.empty_cache()
+
+        if layer_kwargs.get("attention_mask") is not None:
+            layer_kwargs["attention_mask"] = layer_kwargs["attention_mask"].to(
+                best_device
+            )
+
+        self.module_kwargs_ = layer_kwargs
+
+    def _forward_input_with_kwargs(
+        self,
+        module: Module,
+        inputs: torch.Tensor,
+        input_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Forward pass with input arguments
+
+        :param module: module to run forward pass on
+        :param inputs: input tensor to pass to the module
+        :param input_kwargs: additional arguments to pass to the module
+        :return: the first output tensor from the forward pass
+        """
+        kwargs = input_kwargs or self.module_kwargs_ or {}
+        return tensor_forward_with_input_args(
+            module=module,
+            inputs=inputs,
+            input_kwargs=kwargs,
+        )[0]
